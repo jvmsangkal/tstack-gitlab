@@ -39,9 +39,11 @@ cp -R tstack-gitlab/skills/* ~/.codex/skills/    # Codex
 
 ## Requirements
 
-<!-- Placeholder: the pr-wait port sets the real minimum glab version. -->
-- The [GitLab CLI](https://gitlab.com/gitlab-org/cli) (`glab`) 1.126.0 or
+- The [GitLab CLI](https://gitlab.com/gitlab-org/cli) (`glab`) 1.36.0 or
   later, signed in to each GitLab host you use. See [GitLab setup](#gitlab-setup).
+  `pr-wait` alone works from 1.28.0. `file-pr` opens MRs with
+  `glab mr create --description-file`, which needs 1.115.0 or later; on older
+  glab it falls back to the REST API.
 - GitLab 16.0 or later, on any tier. See [Versions and tiers](#versions-and-tiers).
 - `python3` for `babysit-pr`'s `pr-wait` script.
 - `council` and `sol-loop` need subagents on other providers' models. T3 Code
@@ -71,8 +73,8 @@ glab auth status --all
 ```
 
 `--hostname` takes a bare hostname, with no scheme, port, or path. If the API
-listens on another port, add `--api-host gitlab.example.com:8443`. glab keeps
-the token in your OS keyring when one is available.
+listens on another port, add `--api-host gitlab.example.com:8443`. Recent glab
+keeps the token in your OS keyring when one is available.
 
 To use an environment variable instead, set `GITLAB_TOKEN` in the shell that
 runs the agent. For a self-hosted instance, also set `GITLAB_HOST`:
@@ -82,8 +84,8 @@ export GITLAB_HOST=gitlab.example.com   # skip for gitlab.com
 read -rs GITLAB_TOKEN && export GITLAB_TOKEN
 ```
 
-glab sends `GITLAB_TOKEN` only to the `GITLAB_HOST` host and to hosts already
-in its config. gitlab.com is in the config by default. Any other host gets no
+Current glab sends `GITLAB_TOKEN` only to the `GITLAB_HOST` host and to hosts
+already in its config. gitlab.com is in the config by default. Any other host gets no
 token, and its calls fail as if you were signed out. One `GITLAB_TOKEN` covers
 one host, so if you use several hosts, sign in to each with `glab auth login`.
 
@@ -117,7 +119,16 @@ Pushing branches is plain git. Use your usual SSH key or HTTPS credentials.
 2. `GITLAB_HOST`.
 3. The host of the current checkout's git remote, else gitlab.com.
 
-Every host they reach must be signed in, as described above.
+Every host they reach must be signed in, as described above. `pr-wait` refuses
+a host glab has no login for, instead of polling it without a token.
+
+If your instance's address includes a port, like `gitlab.example.com:8443`,
+set `GITLAB_HOST` to it before running `pr-wait`, because glab's `--hostname`
+rejects ports:
+
+```bash
+export GITLAB_HOST=https://gitlab.example.com:8443
+```
 
 ### Versions and tiers
 
