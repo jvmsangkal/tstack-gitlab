@@ -3,7 +3,7 @@ name: file-pr
 description: File a concise GitLab merge request. Use when the user asks to file, open, or create an MR, merge request, or PR.
 ---
 
-# File PR
+# File MR
 
 Before filing, check whether a merge request (MR) for this branch already exists
 with `glab mr list --source-branch <branch>`. Review the diff locally against the
