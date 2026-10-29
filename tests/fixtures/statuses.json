@@ -1,0 +1,22 @@
+[
+  {
+    "id": 5001,
+    "sha": "abc1234def567890abc1234def567890abc12345",
+    "ref": "feature/widget",
+    "name": "build",
+    "status": "success",
+    "description": null,
+    "allow_failure": false,
+    "target_url": "https://gitlab.example.com/group/sub/project/-/jobs/5001"
+  },
+  {
+    "id": 7001,
+    "sha": "abc1234def567890abc1234def567890abc12345",
+    "ref": "feature/widget",
+    "name": "vercel",
+    "status": "success",
+    "description": "Deployment ready",
+    "allow_failure": false,
+    "target_url": "https://vercel.com/acme/widget/abc1234"
+  }
+]

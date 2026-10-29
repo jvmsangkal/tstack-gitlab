@@ -1,0 +1,10 @@
+{
+  "commit": {"id": "c02c02c02c02c02c02c02c02c02c02c02c02c02c"},
+  "commits": [{"id": "c02c02c02c02c02c02c02c02c02c02c02c02c02c", "title": "Refactor app"}],
+  "diffs": [
+    {"old_path": "src/app.py", "new_path": "src/app.py"},
+    {"old_path": "docs/guide.md", "new_path": "docs/guide.md"}
+  ],
+  "compare_timeout": false,
+  "compare_same_ref": false
+}
