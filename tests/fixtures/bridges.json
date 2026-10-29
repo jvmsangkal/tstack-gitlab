@@ -1,0 +1,11 @@
+[
+  {
+    "id": 5005,
+    "name": "downstream",
+    "stage": "test",
+    "status": "success",
+    "allow_failure": false,
+    "web_url": "https://gitlab.example.com/group/sub/project/-/jobs/5005",
+    "downstream_pipeline": {"id": 1002, "project_id": 43, "status": "success"}
+  }
+]

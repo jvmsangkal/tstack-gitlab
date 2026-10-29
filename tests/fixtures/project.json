@@ -1,0 +1,11 @@
+{
+  "id": 42,
+  "name": "project",
+  "path": "project",
+  "path_with_namespace": "group/sub/project",
+  "web_url": "https://gitlab.example.com/group/sub/project",
+  "default_branch": "main",
+  "merge_method": "merge",
+  "only_allow_merge_if_pipeline_succeeds": true,
+  "only_allow_merge_if_all_discussions_are_resolved": true
+}

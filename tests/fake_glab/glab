@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Stand-in for glab in the pr-wait tests. Answers from a scenario file and
+never touches the network.
+
+FAKE_GLAB_SCENARIO  JSON file: {"responses": {key: response | [response, ...]},
+                    "hosts": [hosts glab has a login for]}
+FAKE_GLAB_LOG       directory that receives calls.jsonl and per-key counters
+
+A key is "api <endpoint>" ("api graphql" for GraphQL). A response is
+{"stdout": JSON value or string, "stderr": string, "exit": int}. A list serves
+one entry per call and then repeats its last entry. Unknown keys answer the
+way glab answers an HTTP 404.
+"""
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+VALUE_FLAGS = {
+    "--hostname", "-f", "--raw-field", "-F", "--field", "-X", "--method",
+    "-H", "--header", "--placeholder", "--input", "--output",
+}
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    log_dir = Path(os.environ["FAKE_GLAB_LOG"])
+    scenario = json.loads(Path(os.environ["FAKE_GLAB_SCENARIO"]).read_text())
+    with open(log_dir / "calls.jsonl", "a") as handle:
+        handle.write(json.dumps({"argv": args, "gitlab_host": os.environ.get("GITLAB_HOST")}) + "\n")
+
+    positional: list[str] = []
+    flags: dict[str, list[str]] = {}
+    index = 0
+    while index < len(args):
+        if args[index] in VALUE_FLAGS:
+            flags.setdefault(args[index], []).append(args[index + 1])
+            index += 2
+        else:
+            positional.append(args[index])
+            index += 1
+
+    if positional[:2] == ["auth", "status"]:
+        host = flags["--hostname"][0]
+        if host in scenario.get("hosts", []):
+            print(f"{host}\n  ✓ Logged in to {host} as tester")
+            return 0
+        print(
+            f"x {host} has not been authenticated with glab; run `glab auth login --hostname {host}` to authenticate.",
+            file=sys.stderr,
+        )
+        return 1
+
+    key = " ".join(positional)
+    response = scenario["responses"].get(key)
+    if response is None:
+        print('{"message":"404 Not found"}')
+        print("glab: 404 Not found (HTTP 404)", file=sys.stderr)
+        return 1
+    if isinstance(response, list):
+        counter = log_dir / f"count-{hashlib.sha1(key.encode()).hexdigest()[:12]}"
+        served = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(served + 1))
+        response = response[min(served, len(response) - 1)]
+    stdout = response.get("stdout", "")
+    sys.stdout.write(stdout if isinstance(stdout, str) else json.dumps(stdout))
+    sys.stderr.write(response.get("stderr", ""))
+    return response.get("exit", 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

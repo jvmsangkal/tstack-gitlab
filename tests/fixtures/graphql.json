@@ -1,0 +1,91 @@
+{
+  "data": {
+    "currentUser": {"username": "watcher"},
+    "project": {
+      "mergeRequest": {
+        "approvedBy": {"nodes": []},
+        "reviewers": {
+          "nodes": [
+            {"username": "carol", "bot": false, "mergeRequestInteraction": {"reviewState": "UNREVIEWED"}}
+          ]
+        },
+        "discussions": {
+          "nodes": [
+            {
+              "id": "gid://gitlab/Discussion/d1",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/101",
+                    "url": "https://gitlab.example.com/group/sub/project/-/merge_requests/7#note_101",
+                    "body": "added 1 commit",
+                    "system": true,
+                    "author": {"username": "author", "name": "Ann Author", "bot": false},
+                    "position": null
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/d2",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/102",
+                    "url": "https://gitlab.example.com/group/sub/project/-/merge_requests/7#note_102",
+                    "body": "<h3>Greptile Summary</h3>\nReviewed abc1234.\n**Confidence Score: 5/5**",
+                    "system": false,
+                    "author": {"username": "project_42_bot_3f9a", "name": "Greptile", "bot": true},
+                    "position": null
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/d3",
+              "resolvable": false,
+              "resolved": false,
+              "notes": {
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/Note/103",
+                    "url": "https://gitlab.example.com/group/sub/project/-/merge_requests/7#note_103",
+                    "body": "Looks reasonable overall.",
+                    "system": false,
+                    "author": {"username": "dave", "name": "Dave", "bot": false},
+                    "position": null
+                  }
+                ]
+              }
+            },
+            {
+              "id": "gid://gitlab/Discussion/d4",
+              "resolvable": true,
+              "resolved": false,
+              "notes": {
+                "nodes": [
+                  {
+                    "id": "gid://gitlab/DiffNote/104",
+                    "url": "https://gitlab.example.com/group/sub/project/-/merge_requests/7#note_104",
+                    "body": "Should this handle a missing widget?",
+                    "system": false,
+                    "author": {"username": "erin", "name": "Erin", "bot": false},
+                    "position": {
+                      "filePath": "src/app.py",
+                      "newLine": 12,
+                      "diffRefs": {"headSha": "abc1234def567890abc1234def567890abc12345"}
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

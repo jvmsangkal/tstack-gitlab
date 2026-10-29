@@ -1,0 +1,30 @@
+{
+  "id": 9001,
+  "iid": 7,
+  "project_id": 42,
+  "target_project_id": 42,
+  "source_project_id": 42,
+  "title": "Add widget",
+  "state": "opened",
+  "draft": false,
+  "web_url": "https://gitlab.example.com/group/sub/project/-/merge_requests/7",
+  "target_branch": "main",
+  "source_branch": "feature/widget",
+  "sha": "abc1234def567890abc1234def567890abc12345",
+  "author": {"id": 5, "username": "author", "name": "Ann Author"},
+  "merge_status": "can_be_merged",
+  "detailed_merge_status": "mergeable",
+  "has_conflicts": false,
+  "diverged_commits_count": 0,
+  "merge_when_pipeline_succeeds": false,
+  "head_pipeline": {
+    "id": 1001,
+    "iid": 88,
+    "project_id": 42,
+    "sha": "abc1234def567890abc1234def567890abc12345",
+    "ref": "refs/merge-requests/7/head",
+    "status": "success",
+    "source": "merge_request_event",
+    "web_url": "https://gitlab.example.com/group/sub/project/-/pipelines/1001"
+  }
+}

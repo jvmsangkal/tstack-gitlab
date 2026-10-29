@@ -1,45 +1,55 @@
 #!/usr/bin/env python3
-"""pr-wait: watch one GitHub pull request and print one line per real event.
+"""pr-wait: watch one GitLab merge request and print one line per real event.
 
-  pr-wait <pr> [--repo owner/name] [--until green|ready|any-change] [--interval 20]
+  pr-wait <mr> [--repo group/project] [--until green|ready|any-change] [--interval 20]
 
-<pr> is a PR number or PR URL. Without --repo, the repo comes from the URL or
-from the current checkout. Stdout carries only events, one line each, so a
+<mr> is an MR IID (123, !123, #123), group/project!123, or an MR URL. Without
+--repo, the project comes from the URL or from the current checkout. The host
+comes from the URL, else GITLAB_HOST, else glab's default (the checkout's
+remote, else gitlab.com). Stdout carries only events, one line each, so a
 monitor (Claude Code's Monitor tool) wakes the agent once per real event.
 Progress and errors that do not end the run go to stderr.
 
 --until
-  green       required checks passed on the current head (every CI check when
-              the base branch requires none)
-  ready      green, Greptile or Macroscope reviewed the current head, and no
-              review thread is unresolved (default)
+  green       required jobs passed on the current head: head-pipeline jobs
+              that may not fail, external commit statuses, and MR status checks
+  ready       green, Greptile or Macroscope reviewed the current head, and no
+              thread is unresolved (default)
   any-change  stop after the first poll that prints an event
 
 Exit codes
-  0  the --until condition is met, or the PR merged
-  1  the condition cannot be met without action: a required check failed, the
-     branch conflicts with its base, the PR closed, `ready` is blocked by
-     unresolved threads or a BEHIND branch, or GitHub stayed unreachable
-  2  bad arguments, unknown PR, or another pr-wait already watches this PR
+  0  the --until condition is met, or the MR merged
+  1  the condition cannot be met without action: a required job failed, the
+     branch conflicts with its target, the MR closed, `ready` is blocked by
+     unresolved threads or a branch that needs a rebase, or GitLab stayed
+     unreachable
+  2  bad arguments, unknown MR, a host glab has no login for, or another
+     pr-wait already watches this MR
 
 Events
-  - a required check failed (name and link)
-  - all checks finished on the head (one summary line)
-  - a new comment, review, thread, or thread reply from someone other than the
-    PR author or the gh user
+  - a required job failed (name and link)
+  - all jobs finished on the head (one summary line)
+  - a new comment, approval, change request, thread, or thread reply from
+    someone other than the MR author or the glab user
   - Greptile, Macroscope, or CodeRabbit finished on the head, or a Greptile or
     Macroscope summary changed after that
-  - the base branch moved and the new commits touch files in this PR
-  - merge state became BEHIND or DIRTY
-  - the PR merged or closed
+  - the target branch moved and the new commits touch files in this MR
+  - merge state became BEHIND (need_rebase) or DIRTY (conflict)
+  - the MR merged or closed
 
-CodeRabbit is advisory: pr-wait reports it but never waits for it. Comment
-edits are never events, and top-level comments from CI and deploy bots
-(github-actions, Vercel) are skipped, because checks already carry that news.
+CodeRabbit is advisory: pr-wait reports it but never waits for it. System
+notes (pushes, approvals, label changes) and comment edits are never events,
+and top-level comments from CI and deploy bots (gitlab-bot, Vercel) are
+skipped, because jobs already carry that news.
+
+Auth comes from glab only: `glab auth login --hostname <host>`, or GITLAB_TOKEN
+for gitlab.com and for the GITLAB_HOST host. pr-wait never reads or passes a
+token. glab sends no token to a host it has no login for, so pr-wait refuses
+such a host instead of polling it anonymously.
 
 State lives in ~/.local/state/pr-wait/. A lock makes a second watcher for the
-same PR exit at once. A state file lets a restarted watcher report what arrived
-while no watcher ran. The first run for a PR records what already exists and
+same MR exit at once. A state file lets a restarted watcher report what arrived
+while no watcher ran. The first run for an MR records what already exists and
 reports only what comes after.
 """
 
@@ -56,44 +66,75 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import quote, urlparse
 
 GATING_BOTS = ("greptile", "macroscope")
 ADVISORY_BOTS = ("coderabbit",)
-# CI and deploy bots report through checks. Their PR comments are status reports.
-STATUS_BOTS = ("github-actions", "vercel", "netlify", "railway", "cloudflare")
+# CI and deploy bots report through jobs and statuses. Their MR comments are status reports.
+STATUS_BOTS = ("gitlab-bot", "vercel", "netlify", "railway", "cloudflare")
 STATE_DIR = Path.home() / ".local" / "state" / "pr-wait"
 # A state file older than this describes an old session. Start a fresh baseline
 # instead of replaying hours of comments as new events.
 STALE_STATE_SECONDS = 6 * 3600
 MAX_FAILED_POLLS = 10
 TRANSIENT = re.compile(
-    r"HTTP (5\d\d|429)|rate limit|timed? ?out|connection (reset|refused)|EOF|"
-    r"temporar|could not resolve host|TLS handshake|Something went wrong",
+    r"HTTP (5\d\d|429)|rate limit|too many requests|retry-after|bad gateway|service unavailable|"
+    r"timed? ?out|deadline exceeded|connection (reset|refused)|EOF|temporar|could not resolve host|"
+    r"no such host|network is unreachable|error connecting to|TLS handshake|Something went wrong",
     re.IGNORECASE,
 )
+# Older glab exits 0 after an HTTP error, so the status on stderr decides.
+HTTP_STATUS = re.compile(r"\(HTTP (\d{3})\)")
+# glab's update notice and the frame of its error box are not part of the error.
+NOISE = re.compile(r"new version of glab|/-/releases/v|^ERROR$")
 FAILED = ("fail", "cancel")
-# gh pr checks buckets, worst first. Duplicate names (push and pull_request runs
-# of one job) collapse to the worst bucket.
+# Buckets, worst first. Duplicate names (a job and its commit status, or a
+# branch and an MR pipeline on one commit) collapse to the worst bucket.
 RANK = {"fail": 4, "cancel": 3, "pending": 2, "pass": 1, "skipping": 0}
+# Job, commit status, and MR status check states. Anything else is pending.
+BUCKETS = {
+    "success": "pass", "passed": "pass", "failed": "fail", "canceled": "cancel", "canceling": "cancel",
+    "skipped": "skipping", "manual": "skipping",
+}
+MERGE_STATES = {
+    "conflict": "DIRTY", "need_rebase": "BEHIND", "checking": "UNKNOWN", "unchecked": "UNKNOWN",
+    "preparing": "UNKNOWN", "approvals_syncing": "UNKNOWN", "cannot_be_merged_recheck": "UNKNOWN",
+}
+PER_PAGE = 100
+MAX_PAGES = 20
+MR_URL = re.compile(r"(https?)://([^/\s]+)/([\w.-]+(?:/[\w.-]+)+)/-/merge_requests/(\d+)(?:[/?#]\S*)?")
+PROJECT_URL = re.compile(r"(https?)://([^/\s]+)/([\w.-]+(?:/[\w.-]+)+)/?")
+PROJECT_PATH = re.compile(r"[\w.-]+(?:/[\w.-]+)+")
+MR_REF = re.compile(r"(?:([\w.-]+(?:/[\w.-]+)+)!|[!#])?(\d+)")
 
+# Fields that older or Free-tier instances may lack. A query that names a
+# missing field fails as a whole, so each one is dropped on its first error.
+OPTIONAL = {
+    "approvedBy": "approvedBy { nodes { username bot } }",
+    "reviewers": "reviewers { nodes { username bot mergeRequestInteraction { reviewState } } }",
+}
+OPTIONAL_OWNER = {
+    "approvedBy": "approvedBy", "reviewers": "reviewers",
+    "mergeRequestInteraction": "reviewers", "reviewState": "reviewers",
+}
 QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
-  viewer { login }
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      url state headRefOid baseRefName mergeStateStatus
-      author { login }
-      baseRef { target { oid } }
-      comments(last: 100) { nodes { id url body author { login __typename } } }
-      reviews(last: 100) {
-        nodes { id url state body commit { oid } author { login __typename } }
-      }
-      reviewThreads(last: 100) {
+query($fullPath: ID!, $iid: String!) {
+  currentUser { username }
+  project(fullPath: $fullPath) {
+    mergeRequest(iid: $iid) {
+      %s
+      discussions(last: 100) {
         nodes {
-          isResolved path line
-          comments(first: 100) { nodes { id url body author { login __typename } } }
+          id resolvable resolved
+          notes(first: 100) {
+            nodes {
+              id url body system author { username name bot }
+              position { filePath newLine diffRefs { headSha } }
+            }
+          }
         }
       }
     }
@@ -104,10 +145,10 @@ query($owner: String!, $name: String!, $number: Int!) {
 Json = dict[str, Any]
 
 
-class GhError(Exception):
-    def __init__(self, message: str, transient: bool) -> None:
+class GlabError(Exception):
+    def __init__(self, message: str, transient: bool, status: int | None = None, stdout: str = "") -> None:
         super().__init__(message)
-        self.transient = transient
+        self.transient, self.status, self.stdout = transient, status, stdout
 
 
 def log(message: str) -> None:
@@ -120,37 +161,74 @@ def fail(message: str, code: int = 2) -> NoReturn:
     sys.exit(code)
 
 
-def gh(args: list[str], allow: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
-    """Run gh. Retries transient failures (HTTP 5xx or 429, network) with backoff."""
+def run_glab(args: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(["glab", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        fail("glab is not on PATH. Install glab 1.36.0 or newer: https://gitlab.com/gitlab-org/cli")
+
+
+def glab(args: list[str]) -> str:
+    """Run glab and return stdout. Retries transient failures (HTTP 5xx or 429, network) with backoff."""
     delay = 2
     for attempt in range(5):
-        proc = subprocess.run(["gh", *args], capture_output=True, text=True)
-        transient = proc.returncode != 0 and bool(TRANSIENT.search(proc.stderr))
-        if not transient and proc.returncode in allow:
-            return proc
-        lines = proc.stderr.strip().splitlines()
-        message = lines[-1] if lines else f"gh exited {proc.returncode}"
+        proc = run_glab(args)
+        status = HTTP_STATUS.search(proc.stderr)
+        if proc.returncode == 0 and not status:
+            return proc.stdout
+        lines = [s for s in (line.strip() for line in proc.stderr.splitlines()) if s and not NOISE.search(s)]
+        text = " ".join(lines)
+        transient = bool(TRANSIENT.search(text))
+        message = next((s for s in lines if HTTP_STATUS.search(s)), text) or f"glab exited {proc.returncode}"
         if not transient or attempt == 4:
-            raise GhError(message, transient)
-        log(f"gh {' '.join(args[:2])}: {message}; retry in {delay}s")
+            raise GlabError(message, transient, int(status.group(1)) if status else None, proc.stdout)
+        log(f"glab {'graphql' if 'graphql' in args else args[-1][:80]}: {message}; retry in {delay}s")
         time.sleep(delay)
         delay *= 2
     raise AssertionError("unreachable")
 
 
-def gh_lines(args: list[str]) -> list[str]:
-    return [line for line in gh(args).stdout.splitlines() if line]
+def api(host_args: list[str], path: str) -> Any:
+    out = glab(["api", *host_args, path])
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise GlabError(f"glab api {path} returned no JSON: {out[:100]!r}", True) from None
+
+
+def pages(host_args: list[str], path: str) -> list[Json]:
+    rows: list[Json] = []
+    sep = "&" if "?" in path else "?"
+    for page in range(1, MAX_PAGES + 1):
+        batch = api(host_args, f"{path}{sep}per_page={PER_PAGE}&page={page}")
+        rows.extend(batch)
+        if len(batch) < PER_PAGE:
+            break
+    return rows
 
 
 def bot_name(text: str | None) -> str | None:
-    """Which review bot a login or check name belongs to, if any."""
+    """Which review bot a username, display name, or check name belongs to, if any."""
     lowered = (text or "").lower()
     return next((bot for bot in GATING_BOTS + ADVISORY_BOTS if bot in lowered), None)
 
 
 def who(node: Json) -> tuple[str, bool]:
     author = node.get("author") or {}
-    return author.get("login") or "ghost", author.get("__typename") == "Bot"
+    return author.get("username") or "ghost", bool(author.get("bot"))
+
+
+def bot_of(node: Json) -> str | None:
+    # Review bots often post as project or group access-token users named
+    # project_N_bot_..., so the display name carries the bot's identity.
+    author = node.get("author") or {}
+    return bot_name(author.get("username")) or bot_name(author.get("name"))
+
+
+def is_status_bot(node: Json) -> bool:
+    author = node.get("author") or {}
+    names = f"{author.get('username') or ''} {author.get('name') or ''}".lower()
+    return bool(author.get("bot")) and any(b in names for b in STATUS_BOTS)
 
 
 def plain(body: str) -> str:
@@ -175,46 +253,117 @@ def digest(body: str) -> str:
     return hashlib.sha1(re.sub(r"\s+", " ", plain(body)).encode()).hexdigest()[:12]
 
 
-def parse_target(raw: str | None, repo: str | None) -> tuple[str, int]:
+def check(name: str, status: str, link: str | None, description: str | None, allow_failure: bool) -> Json:
+    bucket = BUCKETS.get(status, "pending")
+    if bucket == "fail" and allow_failure:
+        bucket = "pass"
+    # Jobs allowed to fail and manual jobs never block a pipeline, so they never gate.
+    gates = not allow_failure and status != "manual"
+    return {"name": name, "bucket": bucket, "link": link or "", "description": description or status, "gates": gates}
+
+
+def host_of(url: str) -> str:
+    return urlparse(url if "://" in url else f"https://{url}").netloc.lower()
+
+
+@dataclass
+class Target:
+    host: str
+    project: str
+    iid: int
+    host_args: list[str]
+
+    @property
+    def ref(self) -> str:
+        return f"{self.project}!{self.iid}"
+
+    @property
+    def key(self) -> str:
+        return f"{self.host}__{self.project}__{self.iid}".replace("/", "__").replace(":", "_")
+
+
+def route(host: str | None, scheme: str, default: str | None) -> list[str]:
+    """glab flags that reach host with the user's token. glab sends a token only
+    to GITLAB_HOST and to hosts in its config, and --hostname rejects host:port."""
+    if host is None or host == default:
+        return []
+    if ":" in host:
+        fail(
+            f"glab cannot address {host} with --hostname because it has a port. "
+            f"Run pr-wait with GITLAB_HOST={scheme}://{host}, and GITLAB_TOKEN unless glab has a login for it."
+        )
+    try:
+        proc = subprocess.run(
+            ["glab", "auth", "status", "--hostname", host],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+        )
+    except FileNotFoundError:
+        fail("glab is not on PATH. Install glab 1.36.0 or newer: https://gitlab.com/gitlab-org/cli")
+    except subprocess.TimeoutExpired:
+        return ["--hostname", host]
+    # Exit codes differ across glab versions; this wording does not.
+    if re.search(r"not (been )?authenticated with glab", re.sub(r"\s+", " ", proc.stdout + proc.stderr)):
+        fail(
+            f"glab has no login for {host}, so its calls there would carry no token. "
+            f"Run `glab auth login --hostname {host}`, or set GITLAB_HOST={scheme}://{host} and GITLAB_TOKEN."
+        )
+    return ["--hostname", host]
+
+
+def parse_target(raw: str | None, repo: str | None) -> Target:
     if raw is None or not raw.strip():
-        fail("missing PR number. Did a variable expand to nothing? Usage: pr-wait <pr> [--repo owner/name]")
-    url = re.fullmatch(r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)(?:[/?#]\S*)?", raw.strip())
-    number = re.fullmatch(r"#?(\d+)", raw.strip())
+        fail("missing MR IID. Did a variable expand to nothing? Usage: pr-wait <mr> [--repo group/project]")
+    host: str | None = None
+    scheme = "https"
+    repo_url = PROJECT_URL.fullmatch(repo.strip()) if repo else None
+    if repo_url:
+        scheme, host, repo = repo_url.group(1), repo_url.group(2).lower(), re.sub(r"\.git$", "", repo_url.group(3))
+    url = MR_URL.fullmatch(raw.strip())
+    ref = MR_REF.fullmatch(raw.strip())
     if url:
-        repo = repo or url.group(1)
-        pr = int(url.group(2))
-    elif number:
-        pr = int(number.group(1))
+        if host is None:
+            scheme, host = url.group(1), url.group(2).lower()
+        repo = repo or url.group(3)
+        iid = int(url.group(4))
+    elif ref:
+        repo = repo or ref.group(1)
+        iid = int(ref.group(2))
     else:
-        fail(f"'{raw}' is not a PR number or PR URL")
-    if pr <= 0:
-        fail(f"'{raw}' is not a valid PR number")
+        fail(f"'{raw}' is not an MR IID or MR URL")
+    if iid <= 0:
+        fail(f"'{raw}' is not a valid MR IID")
+    default = host_of(os.environ["GITLAB_HOST"].strip()) if os.environ.get("GITLAB_HOST", "").strip() else None
+    host = host or default
+    host_args = route(host, scheme, default)
     if not repo:
         try:
-            repo = gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).stdout.strip()
-        except GhError as error:
-            fail(f"no --repo given and the current directory has no GitHub repo ({error})")
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
-        fail(f"'{repo}' is not owner/name")
+            repo = api(host_args, "projects/:fullpath")["path_with_namespace"]
+        except GlabError as error:
+            fail(f"no --repo given and the current directory has no GitLab project ({error})")
+    if not PROJECT_PATH.fullmatch(repo):
+        fail(f"'{repo}' is not a group/project path")
     try:
-        gh(["pr", "view", str(pr), "-R", repo, "--json", "number"])
-    except GhError as error:
+        mr = api(host_args, f"projects/{quote(repo, safe='')}/merge_requests/{iid}")
+        host = host or host_of(mr["web_url"])
+    except GlabError as error:
         if not error.transient:  # a transient failure is retried by the poll loop
-            fail(f"cannot read {repo}#{pr}: {error}")
-    return repo, pr
+            fail(f"cannot read {repo}!{iid}: {error}")
+        if host is None:
+            fail(f"cannot read {repo}!{iid}: GitLab unreachable: {error}", 1)
+    return Target(host, repo, iid, host_args)
 
 
-def lock(repo: str, pr: int) -> Any:
-    """Hold a per-PR lock for the life of the process. The OS drops it on exit."""
+def lock(target: Target) -> Any:
+    """Hold a per-MR lock for the life of the process. The OS drops it on exit."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    handle = open(STATE_DIR / f"{repo.replace('/', '__')}__{pr}.lock", "a+")
+    handle = open(STATE_DIR / f"{target.key}.lock", "a+")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         handle.seek(0)
         pid = handle.read().strip() or "unknown"
         fail(
-            f"pid {pid} already watches {repo}#{pr}, so this watcher exits to avoid "
+            f"pid {pid} already watches {target.host}/{target.ref}, so this watcher exits to avoid "
             f"duplicate events. If no events reach you from it, run `kill {pid}` and start again."
         )
     handle.seek(0)
@@ -224,42 +373,25 @@ def lock(repo: str, pr: int) -> Any:
     return handle
 
 
-def required_checks(repo: str, base: str) -> set[str]:
-    """Required check names for the base branch, from rulesets and classic branch
-    protection. Knowing them up front means a required check that has not started
-    yet counts as pending, instead of green by omission."""
-    sources = (
-        (
-            f"repos/{repo}/rules/branches/{base}",
-            '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context',
-        ),
-        (f"repos/{repo}/branches/{base}/protection/required_status_checks", ".contexts[]?, .checks[]?.context"),
-    )
-    names: set[str] = set()
-    for path, jq in sources:
-        try:
-            names.update(gh_lines(["api", path, "--jq", jq]))
-        except GhError as error:
-            if "HTTP 404" not in str(error):  # 404 means no protection, which is normal
-                log(f"could not read required checks from {path}: {error}")
-    return names
-
-
 class Watcher:
-    def __init__(self, repo: str, pr: int, until: str, interval: int) -> None:
-        self.repo, self.pr, self.until, self.interval = repo, pr, until, interval
-        self.owner, self.name = repo.split("/")
-        self.path = STATE_DIR / f"{repo.replace('/', '__')}__{pr}.json"
+    def __init__(self, target: Target, until: str, interval: int) -> None:
+        self.target, self.until, self.interval = target, until, interval
+        self.project_api = f"projects/{quote(target.project, safe='')}"
+        self.mr_api = f"{self.project_api}/merge_requests/{target.iid}"
+        self.path = STATE_DIR / f"{target.key}.json"
         state = self.load()
-        # First run for this PR: record what exists and report nothing.
+        # First run for this MR: record what exists and report nothing.
         self.baseline = state is None
         self.state: Json = state or {"reported": [], "summaries": {}, "base_oid": None, "merge_state": None}
         self.reported: set[str] = set(self.state["reported"])
         self.printed: set[str] = set()
         self.events = 0
-        self.required: set[str] | None = None
+        self.must_succeed: bool | None = None
+        self.status_checks = True
+        self.optional = list(OPTIONAL)
         self.prev_snapshot: list[tuple[str, str]] | None = None
-        self.pr_files: dict[str, set[str]] = {}
+        self.mr_files: dict[str, set[str]] = {}
+        self.web_url = ""
 
     def load(self) -> Json | None:
         try:
@@ -278,10 +410,10 @@ class Watcher:
     def say(self, line: str) -> None:
         if line not in self.printed:
             self.printed.add(line)
-            print(f"#{self.pr} {line}", flush=True)
+            print(f"!{self.target.iid} {line}", flush=True)
 
     def emit(self, key: str, line: str) -> None:
-        """Print an event once per PR, across restarts."""
+        """Print an event once per MR, across restarts."""
         if key in self.reported:
             return
         self.reported.add(key)
@@ -295,77 +427,158 @@ class Watcher:
         self.save()
         sys.exit(code)
 
-    def fetch_pr(self) -> Json:
-        proc = gh([
-            "api", "graphql", "-f", f"query={QUERY}",
-            "-f", f"owner={self.owner}", "-f", f"name={self.name}", "-F", f"number={self.pr}",
-        ])
-        data = json.loads(proc.stdout)["data"]
-        pr = data["repository"]["pullRequest"]
-        pr["viewer"] = data["viewer"]["login"]
-        return pr
+    def api(self, path: str) -> Any:
+        return api(self.target.host_args, path)
 
-    def fetch_checks(self) -> dict[str, Json]:
-        # gh pr checks exits 8 while checks are pending and 1 when one failed.
-        # Those are states, not errors: read the JSON and ignore the exit code.
-        proc = gh(["pr", "checks", str(self.pr), "-R", self.repo, "--json", "name,bucket,link,description"], allow=(0, 1, 8))
-        if not proc.stdout.strip():
-            if "no checks reported" in proc.stderr:
-                return {}
-            raise GhError(proc.stderr.strip() or f"gh pr checks exited {proc.returncode}", False)
+    def pages(self, path: str) -> list[Json]:
+        return pages(self.target.host_args, path)
+
+    def link(self, note: Json) -> str:
+        return note.get("url") or f"{self.web_url}#note_{str(note['id']).rsplit('/', 1)[-1]}"
+
+    def fetch_mr(self) -> Json:
+        return self.api(f"{self.mr_api}?include_diverged_commits_count=true")
+
+    def fetch_graphql(self) -> Json:
+        while True:
+            query = QUERY % " ".join(OPTIONAL[name] for name in self.optional)
+            args = ["api", *self.target.host_args, "graphql", "-f", f"query={query}",
+                    "-f", f"fullPath={self.target.project}", "-f", f"iid={self.target.iid}"]
+            try:
+                data = json.loads(glab(args))
+            except GlabError as error:
+                try:
+                    data = json.loads(error.stdout)
+                except ValueError:
+                    data = {}
+                if error.transient or not isinstance(data, dict) or not data.get("errors"):
+                    raise
+            except ValueError:
+                raise GlabError("glab api graphql returned no JSON", True) from None
+            errors = " ".join(str(e.get("message", "")) for e in data.get("errors") or [])
+            missing = {OPTIONAL_OWNER[f] for f in re.findall(r"Field '(\w+)' doesn't exist", errors) if f in OPTIONAL_OWNER}
+            missing &= set(self.optional)
+            if missing:
+                log(f"this GitLab has no {', '.join(sorted(missing))} in GraphQL; watching without it")
+                self.optional = [name for name in self.optional if name not in missing]
+                continue
+            mr = ((data.get("data") or {}).get("project") or {}).get("mergeRequest")
+            if mr is None:
+                raise GlabError(errors or f"GraphQL cannot see {self.target.ref}", False)
+            return data["data"]
+
+    def setup(self) -> None:
+        """Log what gates this MR, once per run."""
+        try:
+            project = self.api(self.project_api)
+            self.must_succeed = bool(project.get("only_allow_merge_if_pipeline_succeeds"))
+        except GlabError as error:
+            if error.transient:
+                raise
+            log(f"could not read project settings: {error}")
+            self.must_succeed = False
+        log(
+            f"watching {self.target.host}/{self.target.ref} until {self.until}; "
+            f"pipeline must succeed: {'yes' if self.must_succeed else 'no'}; "
+            "jobs that may not fail, external statuses, and MR status checks gate"
+        )
+
+    def fetch_checks(self, mr: Json) -> dict[str, Json]:
+        rows: list[Json] = []
+        # A merged results pipeline runs on a merge commit, so its sha is not the head.
+        pipeline = mr.get("head_pipeline")
+        if pipeline:
+            base = f"projects/{pipeline.get('project_id') or mr['source_project_id']}/pipelines/{pipeline['id']}"
+            for kind in ("jobs", "bridges"):
+                for job in self.pages(f"{base}/{kind}"):
+                    rows.append(check(job["name"], job["status"], job.get("web_url"), job["status"], bool(job.get("allow_failure"))))
+        jobs = {row["name"] for row in rows}
+        try:
+            statuses = self.pages(f"projects/{mr['source_project_id']}/repository/commits/{mr['sha']}/statuses")
+        except GlabError as error:
+            if error.status not in (403, 404):  # a fork you cannot read
+                raise
+            log(f"could not read commit statuses: {error}")
+            statuses = []
+        for status in statuses:
+            link = status.get("target_url") or ""
+            # CI jobs are commit statuses too. Only external ones are new here.
+            if status["name"] in jobs or "/-/jobs/" in link:
+                continue
+            rows.append(check(status["name"], status["status"], link, status.get("description"), bool(status.get("allow_failure"))))
+        if self.status_checks:
+            try:
+                for item in self.api(f"{self.mr_api}/status_checks"):
+                    rows.append(check(item["name"], item["status"], item.get("external_url"), item["status"], False))
+            except GlabError as error:
+                if error.status not in (401, 403, 404):  # MR status checks need Ultimate
+                    raise
+                self.status_checks = False
         checks: dict[str, Json] = {}
-        for row in json.loads(proc.stdout):
+        for row in rows:
             current = checks.get(row["name"])
-            if current is None or RANK.get(row["bucket"], 2) > RANK.get(current["bucket"], 2):
+            if current is None or RANK[row["bucket"]] > RANK[current["bucket"]]:
                 checks[row["name"]] = row
         return checks
 
-    def base_overlap(self, head: str, old: str, new: str) -> list[str]:
-        """Files this PR touches that the new base commits also touch."""
+    def fetch_base_oid(self, base: str) -> str | None:
         try:
-            if head not in self.pr_files:
-                self.pr_files[head] = set(gh_lines(["pr", "diff", str(self.pr), "-R", self.repo, "--name-only"]))
-            moved = gh_lines(["api", f"repos/{self.repo}/compare/{old}...{new}", "--jq", ".files[].filename"])
-        except GhError as error:
-            log(f"could not compare base commits: {error}")
-            return []
-        return sorted(self.pr_files[head].intersection(moved))
+            return self.api(f"{self.project_api}/repository/branches/{quote(base, safe='')}")["commit"]["id"]
+        except GlabError as error:
+            if error.transient:
+                raise
+            log(f"could not read {base}: {error}")
+            return None
 
-    def behind(self, base: str, base_oid: str | None, head: str) -> str:
-        """How far the head is behind its base, for the green and ready lines."""
-        if not base_oid:
-            return ""
+    def base_overlap(self, head: str, old: str, new: str) -> list[str]:
+        """Files this MR touches that the new target branch commits also touch."""
+        def paths(diffs: list[Json]) -> set[str]:
+            return {p for d in diffs for p in (d.get("old_path"), d.get("new_path")) if p}
+
         try:
-            count = gh(["api", f"repos/{self.repo}/compare/{base_oid}...{head}", "--jq", ".behind_by"]).stdout.strip()
-        except GhError:
+            if head not in self.mr_files:
+                self.mr_files[head] = paths(self.pages(f"{self.mr_api}/diffs"))
+            moved = paths(self.api(f"{self.project_api}/repository/compare?from={old}&to={new}").get("diffs") or [])
+        except GlabError as error:
+            log(f"could not compare target branch commits: {error}")
+            return []
+        return sorted(self.mr_files[head].intersection(moved))
+
+    def behind(self, base: str, mr: Json) -> str:
+        """How far the head is behind its target, for the green and ready lines."""
+        count = mr.get("diverged_commits_count")
+        if count is None:
             return ""
-        return f"; {count} commit{'' if count == '1' else 's'} behind {base}"
+        return f"; {count} commit{'' if count == 1 else 's'} behind {base}"
 
     def poll(self) -> None:
-        pr = self.fetch_pr()
-        if pr["state"] == "MERGED":
-            self.finish(0, [f"merged: {pr['url']}"])
-        if pr["state"] == "CLOSED":
-            self.finish(1, [f"closed without merging: {pr['url']}"])
+        mr = self.fetch_mr()
+        self.web_url = mr["web_url"]
+        if mr["state"] == "merged":
+            self.finish(0, [f"merged: {mr['web_url']}"])
+        if mr["state"] == "closed":
+            self.finish(1, [f"closed without merging: {mr['web_url']}"])
 
-        base = pr["baseRefName"]
-        if self.required is None:
-            self.required = required_checks(self.repo, base)
-            gate = ", ".join(sorted(self.required)) or "none set, so every CI check gates"
-            log(f"watching {self.repo}#{self.pr} until {self.until}; required checks: {gate}")
-        checks = self.fetch_checks()
-        head = pr["headRefOid"]
+        base = mr["target_branch"]
+        if self.must_succeed is None:
+            self.setup()
+        node = self.fetch_graphql()
+        checks = self.fetch_checks(mr)
+        head = mr["sha"]
         short = head[:7]
-        mine = {who(pr)[0], pr["viewer"]}
-        comments = pr["comments"]["nodes"]
-        reviews = pr["reviews"]["nodes"]
-        threads = pr["reviewThreads"]["nodes"]
+        mr_node = node["project"]["mergeRequest"]
+        mine = {(mr.get("author") or {}).get("username"), (node.get("currentUser") or {}).get("username")} - {None}
+        discussions = mr_node["discussions"]["nodes"]
+        notes = [(d, [n for n in d["notes"]["nodes"] if not n.get("system")]) for d in discussions]
+        comments = [n for d, ns in notes if not d.get("resolvable") for n in ns]
+        threads = [(d, ns) for d, ns in notes if d.get("resolvable") and ns]
+        approvers = (mr_node.get("approvedBy") or {}).get("nodes") or []
+        reviewers = (mr_node.get("reviewers") or {}).get("nodes") or []
         self.events = 0
 
-        # Required checks. With no required checks configured, every CI check
-        # gates except the review bots' own checks.
-        gate = self.required or {name for name in checks if not bot_name(name)}
-        label = "required check" if self.required else "check"
+        # Jobs that may not fail gate, except the review bots' own checks.
+        gate = {name for name, c in checks.items() if c["gates"] and not bot_name(name)}
+        label = "required check" if self.must_succeed else "check"
 
         def bucket(name: str) -> str:
             return checks[name]["bucket"] if name in checks else "pending"
@@ -379,54 +592,61 @@ class Watcher:
         watched = {name: c for name, c in checks.items() if bot_name(name) not in ADVISORY_BOTS}
         gate_done = bool(gate) and all(bucket(n) != "pending" for n in gate)
         all_done = gate_done and all(c["bucket"] != "pending" for c in watched.values())
-        # Checks appear a few seconds after a push. Two identical polls in a row
-        # guard against calling a half-registered set of checks finished.
+        # Jobs appear a few seconds after a push. Two identical polls in a row
+        # guard against calling a half-created pipeline finished.
         snapshot = sorted((name, c["bucket"]) for name, c in watched.items())
         stable = snapshot == self.prev_snapshot
         self.prev_snapshot = snapshot
         green = gate_done and stable and not fail_lines
 
-        # People and bots talking. Edits are never events.
+        # People and bots talking. Edits and system notes are never events.
         for comment in comments:
-            login, is_bot = who(comment)
-            if login in mine or bot_name(login) or (is_bot and any(b in login for b in STATUS_BOTS)):
+            login, _ = who(comment)
+            if login in mine or bot_of(comment) or is_status_bot(comment):
                 continue
-            self.emit(f"c:{comment['id']}", f"comment from {login}: {snippet(comment['body'])} {comment['url']}")
-        for review in reviews:
-            login, is_bot = who(review)
-            if login in mine or is_bot:
+            self.emit(f"c:{comment['id']}", f"comment from {login}: {snippet(comment['body'])} {self.link(comment)}")
+        for user in approvers:
+            if user["username"] in mine or user.get("bot"):
                 continue
-            if review["state"] in ("APPROVED", "CHANGES_REQUESTED") or review["body"].strip():
-                state = review["state"].lower().replace("_", " ")
-                self.emit(f"c:{review['id']}", f"review from {login} ({state}): {snippet(review['body'])} {review['url']}")
+            self.emit(f"review:{user['username']}:approved:{head}", f"review from {user['username']} (approved) {mr['web_url']}")
+        for user in reviewers:
+            state = (user.get("mergeRequestInteraction") or {}).get("reviewState")
+            if state != "REQUESTED_CHANGES" or user["username"] in mine or user.get("bot"):
+                continue
+            self.emit(
+                f"review:{user['username']}:requested_changes:{head}",
+                f"review from {user['username']} (changes requested) {mr['web_url']}",
+            )
         unresolved: list[str] = []
-        for thread in threads:
-            nodes = thread["comments"]["nodes"]
-            if not thread["isResolved"] and nodes:
-                unresolved.append(nodes[0]["url"])
-            where = f"{thread['path']}:{thread['line']}" if thread["line"] else thread["path"]
-            for index, comment in enumerate(nodes):
-                login, _ = who(comment)
+        for discussion, thread in threads:
+            if not discussion.get("resolved"):
+                unresolved.append(self.link(thread[0]))
+            position = thread[0].get("position") or {}
+            where = f"{position.get('filePath')}:{position['newLine']}" if position.get("newLine") else position.get("filePath") or ""
+            for index, note in enumerate(thread):
+                login, _ = who(note)
                 if login in mine:
                     continue
                 kind = "new thread" if index == 0 else "thread reply"
-                self.emit(f"c:{comment['id']}", f"{kind} from {login} on {where}: {snippet(comment['body'])} {comment['url']}")
+                on = f" on {where}" if where else ""
+                self.emit(f"c:{note['id']}", f"{kind} from {login}{on}: {snippet(note['body'])} {self.link(note)}")
 
         # Review bots on the current head. A bot with checks is done when they
-        # finish. Otherwise it is done once it reviews the head commit or its
-        # summary names the head.
+        # finish. Otherwise it is done once it leaves diff notes on the head
+        # commit or its summary names the head.
         bot_status: dict[str, str] = {}
         reviewed: list[str] = []
+        all_notes = [n for _, ns in notes for n in ns]
         for bot in GATING_BOTS + ADVISORY_BOTS:
             own_checks = {name: c for name, c in checks.items() if bot_name(name) == bot}
-            summaries = [c for c in comments if bot_name(who(c)[0]) == bot]
-            own_reviews = [r for r in reviews if bot_name(who(r)[0]) == bot]
-            on_head = any((r.get("commit") or {}).get("oid") == head for r in own_reviews)
+            summaries = [n for n in all_notes if bot_of(n) == bot and not n.get("position")]
+            diff_notes = [n for n in all_notes if bot_of(n) == bot and n.get("position")]
+            on_head = any(((n["position"].get("diffRefs") or {}).get("headSha")) == head for n in diff_notes)
             if own_checks:
                 done = all(c["bucket"] != "pending" for c in own_checks.values())
             else:
                 done = on_head or any(short in s["body"] for s in summaries)
-            seen = bool(own_checks or summaries or own_reviews)
+            seen = bool(own_checks or summaries or diff_notes)
             if bot in ADVISORY_BOTS and own_checks:
                 desc = next(iter(own_checks.values()))
                 bot_status[bot] = f"{bot} {desc['description'] or desc['bucket']} (advisory)"
@@ -450,10 +670,10 @@ class Watcher:
                     self.state["summaries"][s["id"]] = new
                     if was_done and old and old != new:
                         text = verdict(s["body"]) or snippet(s["body"])
-                        self.emit(f"summary:{s['id']}:{new}", f"{bot} summary changed on {short}: {text} {s['url']}")
+                        self.emit(f"summary:{s['id']}:{new}", f"{bot} summary changed on {short}: {text} {self.link(s)}")
 
-        # Base branch and merge state.
-        base_oid = ((pr.get("baseRef") or {}).get("target") or {}).get("oid")
+        # Target branch and merge state.
+        base_oid = self.fetch_base_oid(base)
         old_base = self.state["base_oid"]
         if base_oid and old_base and base_oid != old_base and not self.baseline:
             touched = self.base_overlap(head, old_base, base_oid)
@@ -461,20 +681,21 @@ class Watcher:
                 more = f" and {len(touched) - 5} more" if len(touched) > 5 else ""
                 self.emit(
                     f"base:{base_oid}",
-                    f"{base} moved to {base_oid[:7]} and touches files in this PR: {', '.join(touched[:5])}{more}",
+                    f"{base} moved to {base_oid[:7]} and touches files in this MR: {', '.join(touched[:5])}{more}",
                 )
         if base_oid:
             self.state["base_oid"] = base_oid
-        merge_state = pr["mergeStateStatus"]
-        dirty_line = f"merge state is DIRTY: the branch conflicts with {base}, rebase it"
-        behind_line = f"merge state is BEHIND: update the branch from {base} before merging"
+        detailed = mr.get("detailed_merge_status") or mr.get("merge_status") or "unchecked"
+        merge_state = "DIRTY" if mr.get("has_conflicts") else MERGE_STATES.get(detailed, detailed)
+        dirty_line = f"merge state is DIRTY (conflict): the branch conflicts with {base}, rebase it"
+        behind_line = f"merge state is BEHIND (need_rebase): rebase the branch onto {base} before merging"
         if merge_state != "UNKNOWN":
             if merge_state in ("BEHIND", "DIRTY") and self.state["merge_state"] != merge_state:
                 line = dirty_line if merge_state == "DIRTY" else behind_line
                 self.emit(f"merge:{merge_state}:{head}:{base_oid}", line)
             self.state["merge_state"] = merge_state
 
-        # One summary line per head once all checks finish.
+        # One summary line per head once all jobs finish.
         counts: dict[str, int] = {}
         for c in watched.values():
             counts[c["bucket"]] = counts.get(c["bucket"], 0) + 1
@@ -482,8 +703,8 @@ class Watcher:
         parts = [
             ", ".join(f"{n} {b}" for b, n in sorted(counts.items()))
             + (f" ({', '.join(failed_names)})" if failed_names else ""),
-            f"required {sum(bucket(n) in ('pass', 'skipping') for n in self.required)}/{len(self.required)} green"
-            if self.required
+            f"required {sum(bucket(n) in ('pass', 'skipping') for n in gate)}/{len(gate)} green"
+            if self.must_succeed
             else "",
             ", ".join(bot_status[b] for b in GATING_BOTS + ADVISORY_BOTS if b in bot_status)
             or "no Greptile or Macroscope yet",
@@ -502,7 +723,7 @@ class Watcher:
                 self.finish(1, fail_lines)
             if green and self.until == "green":
                 self.reported.add(checks_key)
-                self.finish(0, [f"green on {short}: {summary}{self.behind(base, base_oid, head)}"])
+                self.finish(0, [f"green on {short}: {summary}{self.behind(base, mr)}"])
             # ready waits for Greptile or Macroscope, never for CodeRabbit.
             if green and reviewed:
                 if unresolved:
@@ -510,7 +731,7 @@ class Watcher:
                 if merge_state == "BEHIND":
                     self.finish(1, [behind_line])
                 self.reported.add(checks_key)
-                self.finish(0, [f"ready on {short}: {summary}{self.behind(base, base_oid, head)}"])
+                self.finish(0, [f"ready on {short}: {summary}{self.behind(base, mr)}"])
         if all_done and (stable or self.baseline):
             self.emit(checks_key, f"checks finished on {short}: {summary}")
         if self.until == "any-change" and self.events:
@@ -522,31 +743,36 @@ class Watcher:
             try:
                 self.poll()
                 failures = 0
-            except GhError as error:
+            except GlabError as error:
+                if error.status == 401:
+                    self.finish(1, [
+                        f"pr-wait stopped: {error}. glab has no valid token for {self.target.host}: "
+                        f"run `glab auth login --hostname {self.target.host}`, or set GITLAB_TOKEN"
+                    ])
                 if not error.transient:
                     self.finish(1, [f"pr-wait stopped: {error}"])
                 failures += 1
                 log(f"poll failed ({failures}/{MAX_FAILED_POLLS}): {error}")
                 if failures >= MAX_FAILED_POLLS:
-                    self.finish(1, [f"pr-wait stopped: GitHub unreachable for {failures} polls: {error}"])
+                    self.finish(1, [f"pr-wait stopped: GitLab unreachable for {failures} polls: {error}"])
             else:
                 self.save()
                 if self.baseline:
-                    log(f"baseline recorded for {self.repo}#{self.pr}; reporting only new events")
+                    log(f"baseline recorded for {self.target.ref}; reporting only new events")
                 self.baseline = False
             time.sleep(self.interval)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="pr-wait", description="Watch a GitHub PR and print one line per real event.")
-    parser.add_argument("pr", nargs="?", help="PR number or URL")
-    parser.add_argument("--repo", help="owner/name (default: from the URL or the current checkout)")
+    parser = argparse.ArgumentParser(prog="pr-wait", description="Watch a GitLab merge request and print one line per real event.")
+    parser.add_argument("mr", nargs="?", help="MR IID (123 or !123), group/project!123, or MR URL")
+    parser.add_argument("-R", "--repo", help="group/project path or project URL (default: from the URL or the current checkout)")
     parser.add_argument("--until", choices=("green", "ready", "any-change"), default="ready")
     parser.add_argument("--interval", type=int, default=20, help="seconds between polls (default 20, min 5)")
     args = parser.parse_args()
-    repo, pr = parse_target(args.pr, args.repo)
-    _lock = lock(repo, pr)
-    Watcher(repo, pr, args.until, max(args.interval, 5)).run()
+    target = parse_target(args.mr, args.repo)
+    _lock = lock(target)
+    Watcher(target, args.until, max(args.interval, 5)).run()
 
 
 if __name__ == "__main__":

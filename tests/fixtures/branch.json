@@ -1,0 +1,9 @@
+{
+  "name": "main",
+  "protected": true,
+  "commit": {
+    "id": "b01b01b01b01b01b01b01b01b01b01b01b01b01b",
+    "short_id": "b01b01b0",
+    "title": "Merge branch 'other' into 'main'"
+  }
+}
