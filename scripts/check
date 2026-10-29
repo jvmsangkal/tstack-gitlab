@@ -15,6 +15,9 @@ python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' 
 echo "==> $pr_wait --help"
 "$pr_wait" --help >/dev/null
 
+echo "==> scripts/check-github-residue"
+scripts/check-github-residue
+
 echo "==> unittest"
 set -- tests/test*.py
 if [ -e "$1" ]; then

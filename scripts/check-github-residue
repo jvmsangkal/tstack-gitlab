@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""check-github-residue: fail on GitHub-specific text outside the allowlist.
+
+This fork targets GitLab, so GitHub terms (the gh CLI, api.github.com,
+GITHUB_TOKEN, pull request wording, GitHub API fields) may stay only where
+scripts/github-residue-allowlist says they stay on purpose.
+
+Each allowlist line is "<path> <text>". A hit in <path> is allowed only when
+it falls inside an occurrence of <text>. A path with no text allows the whole
+file. An entry that allows nothing fails too, so the list stays small.
+"""
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ALLOWLIST = Path(__file__).resolve().parent / "github-residue-allowlist"
+SKIP_DIRS = {".git", "__pycache__"}
+
+RESIDUE = re.compile("|".join([
+    r"github",                      # GitHub, github.com, api.github.com, GITHUB_TOKEN, .github/
+    r"(?<![\w-])gh(?![\w-])",       # the gh CLI
+    r"\bgh_\w+",                    # GH_TOKEN, GH_HOST
+    r"pull[\s_-]*requests?",        # "pull request" (also wrapped), pull_request, pullRequest
+    r"(?<![\w-])prs?(?![\w-])",     # PR, PRs; not pr-wait, file-pr, pr_wait
+    r"\bpulls\b",                   # REST repos/<owner>/<repo>/pulls
+    r"check[\s_-]*runs?",           # check runs
+    r"--jq\b",                      # gh api --jq; glab api has none
+    r"\b(?:headRefOid|headRefName|baseRefName|mergeStateStatus|reviewThreads|reviewDecision)\b",
+]), re.IGNORECASE)
+
+
+def load_allowlist():
+    entries = []
+    for number, line in enumerate(ALLOWLIST.read_text(encoding="utf-8").splitlines(), 1):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            path, _, text = line.partition(" ")
+            entries.append((number, path, text.strip()))
+    return entries
+
+
+def files():
+    for path in sorted(ROOT.rglob("*")):
+        if path.is_file() and not SKIP_DIRS.intersection(path.relative_to(ROOT).parts):
+            yield path
+
+
+def allowing(entries, text, match):
+    for entry in entries:
+        allowed = entry[2]
+        if not allowed:
+            return entry
+        for found in re.finditer(re.escape(allowed), text):
+            if found.start() <= match.start() and match.end() <= found.end():
+                return entry
+    return None
+
+
+def main():
+    entries = load_allowlist()
+    used = set()
+    hits = []
+    for path in files():
+        rel = path.relative_to(ROOT).as_posix()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        mine = [entry for entry in entries if entry[1] == rel]
+        lines = text.splitlines()
+        for match in RESIDUE.finditer(text):
+            entry = allowing(mine, text, match)
+            if entry:
+                used.add(entry[0])
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            found = " ".join(match.group().split())
+            hits.append(f"{rel}:{line}: {found!r} in: {lines[line - 1].strip()}")
+    stale = [f"line {n}: {path} {text}".rstrip() for n, path, text in entries if n not in used]
+    if hits:
+        print("GitHub residue. Translate it to GitLab, or allowlist it in "
+              "scripts/github-residue-allowlist if it stays on purpose:", file=sys.stderr)
+        print("\n".join(f"  {hit}" for hit in hits), file=sys.stderr)
+    if stale:
+        print("Allowlist entries that allow nothing; remove them:", file=sys.stderr)
+        print("\n".join(f"  {entry}" for entry in stale), file=sys.stderr)
+    return 1 if hits or stale else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
