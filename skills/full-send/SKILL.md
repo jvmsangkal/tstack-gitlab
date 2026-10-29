@@ -135,9 +135,10 @@ run the gate again on the new head. After merging, confirm the MR's `state` is
 `merged`. Report `merge_commit_sha` as the merge commit, or `squash_commit_sha`
 when squashed, or the MR's final `sha` if neither is set.
 
-If `merge_trains_enabled` is `true`, do not use `glab mr merge`. Before
-GitLab 19.1 it can merge directly and skip the train. Add the MR to the train
-instead, and stay until its `state` is `merged`:
+If `merge_trains_enabled` is `true`, do not use `glab mr merge`. It would merge
+directly and skip the train: always with `--auto-merge=false`, and before
+GitLab 19.1 even with auto-merge. Add the MR to the train instead, and stay
+until its `state` is `merged`:
 
 ```sh
 glab api -X POST projects/:fullpath/merge_trains/merge_requests/<iid> -f sha=<reviewed sha>
