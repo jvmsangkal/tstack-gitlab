@@ -5,8 +5,8 @@ description: Trigger this if the user says 'council'.
 
 # Council
 
-Before an audit, address outstanding PR comments, fix known issues, and run
-relevant checks. Give council the updated implementation; do not defer known
+Before an audit, address outstanding merge request (MR) comments, fix known
+issues, and run relevant checks. Give council the updated implementation; do not defer known
 fixes until reviews return. If the user wants to discard the implementation
 and explore new ideas, skip fixes to code being replaced.
 
@@ -29,7 +29,7 @@ For a code review, ask each delegate for a score out of 10.
 Count each full review pass as one round.
 A fresh review after fixes starts a new round.
 
-If the work ends in a pull request, put the results in the PR description.
+If the work ends in an MR, put the results in the MR description.
 Put this section before the model and harness line at the end:
 
 ```markdown
@@ -45,8 +45,12 @@ Rounds: 2
 ```
 
 If a delegate gives no score, write `no score`. Do not invent one.
-If the PR is open, edit the description. Do not post a comment for this.
-If there is no PR, put the same results in the final reply only.
+If the MR is open, edit the description. Do not post a comment for this.
+Read `description` from `glab api projects/:fullpath/merge_requests/<iid>`,
+write the full updated text to a file, then run
+`glab api -X PUT projects/:fullpath/merge_requests/<iid> -F description=@<file>`.
+The PUT replaces the whole description.
+If there is no MR, put the same results in the final reply only.
 
 If you agree with their recommendations, make the changes and request a fresh
 review after. Continue this process until all delegates are satisfied with the
