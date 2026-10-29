@@ -34,7 +34,10 @@ branch, current head SHA, author, pipeline, and approval state. Read
 `detailed_merge_status`, and `.../merge_requests/<iid>/approvals` for
 `approved_by`. For an MR in another project, use its URL-encoded path
 (`projects/group%2Fsub%2Fproject/...`) and pass `--hostname <host>` for a
-self-hosted instance. Read the title, description, linked issues
+self-hosted instance. `--hostname` alone sends no token, so make sure that host
+is authenticated first (`glab auth login --hostname <host>`, or set
+`GITLAB_HOST=<host>`); it takes a bare host, not `host:port`. Read the title,
+description, linked issues
 (`.../merge_requests/<iid>/closes_issues` plus `Closes #n` in the description),
 commits, threads (`.../merge_requests/<iid>/discussions`), and complete diff.
 State the smallest coherent goal the MR was trying to accomplish before judging
