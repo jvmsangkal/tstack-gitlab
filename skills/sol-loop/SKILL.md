@@ -6,8 +6,8 @@ description: Use when the user says "sol loop".
 # sol-loop
 
 This is a workflow for making your code changes more correct before (or
-sometimes after) filing a pull request. tl;dr - use OpenAI's GPT Sol to review
-your code in a loop.
+sometimes after) filing a merge request (MR). tl;dr - use OpenAI's GPT Sol to
+review your code in a loop.
 
 Make the most minimal possible changes to appease the Sol reviewers. Be careful
 of scope creep and don't be scared to push back.
@@ -32,9 +32,15 @@ Otherwise stop and ask.
 
 Find the base after `git fetch origin`:
 
-- PR: `gh pr view <n> --json baseRefName,headRefOid`. Check out the branch
-  only if clean. Confirm `HEAD` is the PR head, or ahead only by this
-  change. Base: `git merge-base HEAD origin/<baseRefName>`.
+- MR: `glab api projects/:fullpath/merge_requests/<n>`, read `target_branch`
+  and `sha`. For an MR URL, add `--hostname <host>` and use the URL-encoded
+  project path (`projects/group%2Fproject/...`); that host must be
+  authenticated (`glab auth login --hostname <host>` or `GITLAB_HOST=<host>`).
+  Check out the branch only if clean. Fork MR (`source_project_id` differs
+  from `target_project_id`): `git fetch origin refs/merge-requests/<n>/head`,
+  read-only, deleted 14 days after merge or close; then fetch the source
+  branch from the fork. Confirm `HEAD` is the MR head (`sha`), or ahead only
+  by this change. Base: `git merge-base HEAD origin/<target_branch>`.
 - Local: `git merge-base HEAD origin/<default-branch>`. No remote: a base
   the user names, or `HEAD` for uncommitted changes only.
 
@@ -64,7 +70,7 @@ approval. On failure, cancel, verify stop, restart with the ledger.
 Round 1 brief (T3 children get no history):
 
 ```
-Review only. Do not edit, commit, push, comment on PRs, or start subagents.
+Review only. Do not edit, commit, push, comment on MRs, or start subagents.
 Repo: <abs path> Base: <sha> Intent: <intent> Out of scope: <scope> Checks: <results>
 See: git diff <base> [-- <paths>]; git status --short (read untracked).
 Read surrounding code. Find bugs, broken callers, mismatch with intent.
@@ -108,8 +114,9 @@ or budget ends. Show both sides in 2-3 lines each. The user decides.
 Budget end is not approval.
 
 Do not push during the loop. Push after agreement only if the user asked
-to push, ship, or update the PR. If you push to a PR, add above the model
-blurb:
+to push, ship, or update the MR. A fork MR's branch is in the source
+project; pushing to someone else's fork needs `allow_collaboration`. If you
+push to an MR, add above the model blurb:
 
 `Reviewed with sol-loop: <N> rounds with <model>. Sol verdict: approved`.
 
