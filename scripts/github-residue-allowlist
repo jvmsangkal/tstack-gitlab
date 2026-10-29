@@ -1,0 +1,35 @@
+# GitHub text that stays on purpose. See scripts/check-github-residue.
+# <path> <text>: allow hits inside <text> in <path>. <path> alone: the whole file.
+
+# The guard has to name what it looks for.
+scripts/check-github-residue
+scripts/github-residue-allowlist
+
+# This repo is hosted on GitHub, so its own CI runs on GitHub Actions.
+.github/workflows/check.yml
+scripts/check GitHub Actions
+scripts/check check-github-residue
+
+# Upstream credit, T3 Code, and this repo's clone URL.
+README.md https://github.com/t3dotgg/tstack
+README.md https://github.com/pingdotgg/t3code
+README.md https://github.com/jvmsangkal/tstack-gitlab
+README.md upstream tstack's `pr`
+
+# "PR" stays a trigger word in skill descriptions, next to MR.
+skills/babysit-pr/SKILL.md babysit an MR or PR.
+skills/file-pr/SKILL.md an MR, merge request, or PR.
+skills/modernize/SKILL.md (MRs, PRs)
+skills/modernize/SKILL.md an MR or PR,
+skills/takeover/SKILL.md merge request (MR) or PR,
+
+# T3 Code's watcher tools keep their names.
+skills/babysit-pr/SKILL.md watch_pull_request
+skills/full-send/SKILL.md watch_pull_request
+skills/full-stop/SKILL.md watch_pull_request
+
+# Macroscope's rules directory, a bot convention.
+skills/babysit-pr/SKILL.md .macroscope/check-run-agents
+
+# pr-wait must reject GitHub URLs.
+tests/test_pr_wait.py https://github.com/{PROJECT}/pull/7
