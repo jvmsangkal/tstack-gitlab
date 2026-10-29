@@ -1,17 +1,18 @@
 ---
 name: file-pr
-description: File a concise pull request. Use when the user asks to file, open, or create a PR.
+description: File a concise GitLab merge request. Use when the user asks to file, open, or create an MR, merge request, or PR.
 ---
 
-# File PR
+# File MR
 
-Before filing, check whether a PR for this branch already exists. Review the
-diff locally against the base branch (usually `origin/main`) to make sure its
-contents match the goal.
+Before filing, check whether a merge request (MR) for this branch already exists
+with `glab mr list --source-branch <branch>`. Review the diff locally against the
+target branch (usually `origin/main`) to make sure its contents match the goal.
 
-PR titles usually become commit messages, so follow the repository's title
-conventions. Look at recently merged PRs and Git history for examples. Prefer a
-concise, human-readable title that explains why the change matters:
+MR titles usually become commit messages, so follow the project's title
+conventions. Look at recently merged MRs, Git history, and any templates in
+`.gitlab/merge_request_templates/` for examples. Prefer a concise,
+human-readable title that explains why the change matters:
 
 BAD
 
@@ -41,10 +42,14 @@ If model identity is unavailable, name the harness without guessing a model.
 Before submission, check the title, description, quotes, and attachments for
 secrets and private details.
 
-Open a real PR rather than a draft so review bots run. If `gh pr create` fails
-because the GraphQL rate limit is used up, open it through REST with
-`gh api repos/<owner>/<repo>/pulls -f title=... -f head=... -f base=... -F body=@<file>`. If the user also asked
+Open a real MR rather than a draft so review bots run. Do not pass `--draft`,
+`--wip`, `--auto-merge`, or `--fill`. Push the branch, write the description to
+a file, and run
+`glab mr create --source-branch <branch> --target-branch <target> --title <title> --description-file <file> --yes`.
+If that fails, or glab predates `--description-file` (added in 1.115), open it
+through REST with
+`glab api projects/:fullpath/merge_requests -f source_branch=... -f target_branch=... -f title=... -F description=@<file>`. If the user also asked
 to babysit it, continue with the `babysit-pr` skill.
 
-Do not post a follow-up PR comment unless it serves the user's request. When a
+Do not post a follow-up MR comment unless it serves the user's request. When a
 comment is needed, use the `leaving-pr-comments` skill.
